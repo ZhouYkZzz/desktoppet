@@ -1,8 +1,9 @@
 import sys, os, json
 import requests
 from pathlib import Path
-from PyQt5.QtWidgets import (QApplication, QLabel, QWidget,
-                             QMenu, QMessageBox, QInputDialog)
+from PyQt5.QtWidgets import (
+    QApplication, QLabel, QWidget, QMenu, QMessageBox, QInputDialog
+)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QMovie, QPixmap
 
@@ -11,6 +12,9 @@ CONFIG_PATH = Path.home() / ".desktop_pet_config.json"
 # ---------- 高德 API 端点 ----------
 GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
 WEATHER_URL = "https://restapi.amap.com/v3/weather/weatherInfo"
+
+# ---------- **在此处填入你的高德 Web API Key** ----------
+API_KEY = "e84310e1f93659655488638257320d47"               # ← 换成自己的 Key
 
 # ----------- 天气后台线程 -----------
 class WeatherThread(QThread):
@@ -45,7 +49,7 @@ class WeatherThread(QThread):
                 WEATHER_URL,
                 params={
                     "city": adcode,
-                    "extensions": "all",   # all = 预报 + 实况
+                    "extensions": "all",
                     "output": "JSON",
                     "key": self.api_key,
                 },
@@ -75,10 +79,12 @@ class DesktopPet(QWidget):
         super().__init__()
 
         # —— 窗口 & 透明 —— #
-        self.setWindowFlags(Qt.FramelessWindowHint
-                            | Qt.WindowStaysOnTopHint
-                            | Qt.WindowDoesNotAcceptFocus
-                            | Qt.NoDropShadowWindowHint)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+            | Qt.NoDropShadowWindowHint
+        )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         # —— Label & GIF —— #
@@ -103,7 +109,9 @@ class DesktopPet(QWidget):
         self.speed       = 1
         self.screen_rect = QApplication.primaryScreen().geometry()
         self.offset      = 50
-        self.base_y      = self.screen_rect.height() - self.height() - self.offset
+        self.base_y      = (
+            self.screen_rect.height() - self.height() - self.offset
+        )
         self.move(100, self.base_y)
 
         self.timer = QTimer(self, timeout=self.move_pet)
@@ -112,7 +120,7 @@ class DesktopPet(QWidget):
         # —— 城市 & 天气 —— #
         self.city     = self.load_city()
         self.w_thread = None
-        self.fetch_weather()
+        self.fetch_weather()   # ← 直接启动天气查询
 
     # ---------- 城市持久化 ----------
     def load_city(self) -> str:
@@ -132,16 +140,19 @@ class DesktopPet(QWidget):
 
     # ---------- 启动天气线程 ----------
     def fetch_weather(self):
-        key = os.getenv("pet_weather_key")
-        if not key:
-            QMessageBox.warning(self, "天气提醒", "未设置环境变量 pet_weather_key")
+        if not API_KEY or API_KEY == "YOUR_AMAP_API_KEY":
+            QMessageBox.warning(
+                self,
+                "天气提醒",
+                "请在源码顶部 API_KEY 处填入你的高德 Web API Key！"
+            )
             return
 
         if self.w_thread and self.w_thread.isRunning():
             self.w_thread.quit()
             self.w_thread.wait()
 
-        self.w_thread = WeatherThread(key, self.city, self)
+        self.w_thread = WeatherThread(API_KEY, self.city, self)
         self.w_thread.finished.connect(self.show_weather_popup)
         self.w_thread.error.connect(self.show_weather_error)
         self.w_thread.start()
@@ -149,7 +160,7 @@ class DesktopPet(QWidget):
     # ---------- 弹窗 ----------
     def show_weather_popup(self, payload):
         def fmt(day):
-            main = day["dayweather"].lower()      # “小雨”
+            main = day["dayweather"].lower()
             desc = f'{day["dayweather"]}/{day["nightweather"]}'
             tmin = int(day["nighttemp"])
             tmax = int(day["daytemp"])
@@ -157,18 +168,20 @@ class DesktopPet(QWidget):
 
         main_today, info_today = fmt(payload["today"])
         main_tom,   info_tom   = fmt(payload["tomorrow"])
-        need_umbrella = any(k in (main_today, main_tom)
-                            for k in ("雨", "雷"))
+        need_umbrella = any(k in (main_today, main_tom) for k in ("雨", "雷"))
 
-        msg =  (f"{self.city} 今天：{info_today}\n"
-                f"{self.city} 明天：{info_tom}")
+        msg = (
+            f"{self.city} 今天：{info_today}\n"
+            f"{self.city} 明天：{info_tom}"
+        )
         if need_umbrella:
             msg += "\n\n🌧 记得带伞！"
         QMessageBox.information(self, "天气提醒", msg)
 
     def show_weather_error(self, err):
-        QMessageBox.warning(self, "天气提醒",
-                            f"城市：{self.city}\n天气信息获取失败：{err}")
+        QMessageBox.warning(
+            self, "天气提醒", f"城市：{self.city}\n天气信息获取失败：{err}"
+        )
 
     # ---------- 右键菜单 ----------
     def contextMenuEvent(self, e):
@@ -177,10 +190,10 @@ class DesktopPet(QWidget):
         self.timer.stop()
         self.movie.setPaused(True)
 
-        menu    = QMenu(self)
-        loc_act = menu.addAction("位置…")
-        quit_act= menu.addAction("退出")
-        chosen  = menu.exec_(e.globalPos())
+        menu     = QMenu(self)
+        loc_act  = menu.addAction("位置…")
+        quit_act = menu.addAction("退出")
+        chosen   = menu.exec_(e.globalPos())
 
         if chosen == loc_act:
             self.change_city()
@@ -195,15 +208,17 @@ class DesktopPet(QWidget):
     # ---------- 修改城市 ----------
     def change_city(self):
         text, ok = QInputDialog.getText(
-            self, "设置位置", "请输入城市名（中文/拼音/英文皆可）：", text=self.city)
+            self, "设置位置", "请输入城市名（中文/拼音/英文皆可）：", text=self.city
+        )
         if ok and text.strip():
             self.city = text.strip()
             self.save_city()
             self.fetch_weather()
 
     # ---------- 其余：动画 & 交互 ----------
-    def resource_path(self, rel):
-        if getattr(sys, 'frozen', False):
+    @staticmethod
+    def resource_path(rel):
+        if getattr(sys, "frozen", False):
             return os.path.join(os.environ.get("RESOURCEPATH", ""), rel)
         return os.path.join(os.path.abspath("."), rel)
 
@@ -254,15 +269,19 @@ class DesktopPet(QWidget):
     def mouseMoveEvent(self, e):
         if e.buttons() & Qt.LeftButton and self.dragging:
             new_pos = e.globalPos() - self.drag_pos
-            new_x = max(0, min(new_pos.x(), self.screen_rect.width() - self.width()))
-            new_y = max(0, min(new_pos.y(), self.screen_rect.height() - self.height()))
+            new_x = max(
+                0, min(new_pos.x(), self.screen_rect.width() - self.width())
+            )
+            new_y = max(
+                0, min(new_pos.y(), self.screen_rect.height() - self.height())
+            )
             self.move(new_x, new_y)
             e.accept()
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and self.dragging:
             self.dragging = False
-            self.base_y  = self.y()
+            self.base_y = self.y()
             inside = self.rect().contains(self.mapFromGlobal(e.globalPos()))
             if not inside:
                 self.switch_movie(self.movie_main)
