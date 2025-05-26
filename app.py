@@ -1,8 +1,14 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Desktop‑Pet with calendar duration selector (macOS).
+"""
 import sys, os, json, subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 import requests
-from typing import Optional   # ① 这里新增
+from typing import Optional
+
 from PyQt5.QtWidgets import (
     QApplication, QLabel, QWidget, QMenu, QMessageBox,
     QInputDialog, QDialog, QVBoxLayout, QHBoxLayout,
@@ -59,7 +65,7 @@ class WeatherThread(QThread):
 
 # ----------- 日程对话框 -----------
 class EventDialog(QDialog):
-    """日期 + 时间 + 标题 选择对话框"""
+    """日期 + 时间 + 持续时长 + 标题 选择对话框"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("新建日程")
@@ -68,25 +74,38 @@ class EventDialog(QDialog):
         today = QDate.currentDate()
         next_hour = (datetime.now() + timedelta(hours=1)).time().replace(second=0, microsecond=0)
 
+        # 起始日期
         self.date_edit = QDateEdit(today, self)
         self.date_edit.setCalendarPopup(True)
 
+        # 起始时间
         self.time_edit = QTimeEdit(QTime(next_hour.hour, next_hour.minute), self)
         self.time_edit.setDisplayFormat("HH:mm")
 
+        # ▶ 新增：持续时长（默认 01:00）
+        self.duration_edit = QTimeEdit(QTime(1, 0), self)
+        self.duration_edit.setDisplayFormat("HH:mm")
+        # 如果想要 5 分钟递增，取消下一行注释
+        # self.duration_edit.setSingleStep(QTime(0, 5))
+
+        # 事件标题
         self.title_edit = QLineEdit(self)
         self.title_edit.setPlaceholderText("事件标题…")
 
+        # 按钮
         ok_btn = QPushButton("创建", self)
         cancel_btn = QPushButton("取消", self)
         ok_btn.clicked.connect(self.accept)
         cancel_btn.clicked.connect(self.reject)
 
+        # 布局
         vbox = QVBoxLayout(self)
         vbox.addWidget(QtLabel("选择日期："))
         vbox.addWidget(self.date_edit)
         vbox.addWidget(QtLabel("选择时间："))
         vbox.addWidget(self.time_edit)
+        vbox.addWidget(QtLabel("持续时长："))      # ← 新增
+        vbox.addWidget(self.duration_edit)        # ← 新增
         vbox.addWidget(QtLabel("事件标题："))
         vbox.addWidget(self.title_edit)
 
@@ -96,6 +115,7 @@ class EventDialog(QDialog):
         hbtn.addWidget(cancel_btn)
         vbox.addLayout(hbtn)
 
+    # -------- 返回起始时间、持续时长、标题 --------
     @staticmethod
     def get_event(parent=None):
         dlg = EventDialog(parent)
@@ -103,9 +123,13 @@ class EventDialog(QDialog):
             d = dlg.date_edit.date().toPyDate()
             t = dlg.time_edit.time().toPyTime()
             start_dt = datetime.combine(d, t)
+
+            dur_qt = dlg.duration_edit.time()
+            duration = timedelta(hours=dur_qt.hour(), minutes=dur_qt.minute())
+
             title = dlg.title_edit.text().strip() or "提醒"
-            return start_dt, title
-        return None, None
+            return start_dt, duration, title
+        return None, None, None
 
 
 # ----------- 桌面宠物 -----------
@@ -123,8 +147,8 @@ class DesktopPet(QWidget):
         # —— Label & GIF —— #
         self.label = QLabel(self)
         self.label.setStyleSheet("background: transparent; border: none;")
-        self.resize(100, 100)
-        self.label.resize(100, 100)
+        self.resize(200, 200)
+        self.label.resize(200, 200)
 
         self.movie_main = QMovie(self.resource_path("mostima.gif"))
         self.movie_relax = QMovie(self.resource_path("relax.gif"))
@@ -141,7 +165,7 @@ class DesktopPet(QWidget):
         self.direction = 1
         self.speed = 1
         self.screen_rect = QApplication.primaryScreen().geometry()
-        self.offset = 50
+        self.offset = 0
         self.base_y = self.screen_rect.height() - self.height() - self.offset
         self.move(100, self.base_y)
 
@@ -153,7 +177,17 @@ class DesktopPet(QWidget):
         self.w_thread = None
         self.fetch_weather()
 
-    # ---------- 城市持久化 ----------
+        # —— 新增的天气显示部分 —— #
+        self.weather_label = QLabel(self)
+        self.weather_label.setAlignment(Qt.AlignCenter)
+        self.weather_label.setStyleSheet("font-size: 12px; color: white; background: transparent;")
+        self.weather_label.setGeometry(0, 20, self.width(), self.height())
+
+        # —— 新增的5秒后隐藏Label —— #
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)  # 确保只触发一次
+        self.hide_timer.timeout.connect(self.hide_label)
+
     def load_city(self):
         if CONFIG_PATH.exists():
             try:
@@ -178,11 +212,11 @@ class DesktopPet(QWidget):
             self.w_thread.wait()
 
         self.w_thread = WeatherThread(API_KEY, self.city, self)
-        self.w_thread.finished.connect(self.show_weather_popup)
+        self.w_thread.finished.connect(self.show_weather_label)
         self.w_thread.error.connect(self.show_weather_error)
         self.w_thread.start()
 
-    def show_weather_popup(self, data):
+    def show_weather_label(self, data):
         def fmt(day):
             desc = f'{day["dayweather"]}/{day["nightweather"]}'
             tmin, tmax = int(day["nighttemp"]), int(day["daytemp"])
@@ -191,10 +225,24 @@ class DesktopPet(QWidget):
         d1, t1 = fmt(data["today"])
         d2, t2 = fmt(data["tomorrow"])
         msg = f"{self.city} 今天：{d1} {t1}\n{self.city} 明天：{d2} {t2}"
-        QMessageBox.information(self, "天气提醒", msg)
+
+        # 设置天气信息到QLabel
+        self.weather_label.setText(msg)
+        self.weather_label.adjustSize()  # 调整 QLabel 大小适应内容
+
+        # 启动定时器，5秒后隐藏 label
+        self.hide_timer.start(5000)
 
     def show_weather_error(self, err):
-        QMessageBox.warning(self, "天气提醒", f"城市：{self.city}\n天气信息获取失败：{err}")
+        self.weather_label.setText(f"获取天气信息失败：{err}")
+
+    def hide_label(self):
+        self.weather_label.setText("")  # 清空天气信息
+        self.weather_label.adjustSize()  # 调整大小
+        old_x, old_y = self.x(), self.y()
+        self.resize(100,200)  # 调整窗口大小以适应隐藏后的状态
+        self.label.resize(100, 200)  # 调整 QLabel 大小
+        self.move(old_x, old_y)  # 保持原位置
 
     # ---------- 右键菜单 ----------
     def contextMenuEvent(self, e):
@@ -231,15 +279,18 @@ class DesktopPet(QWidget):
 
     # ---------- 新建日程 ----------
     def create_calendar_event(self):
-        start_dt, title = EventDialog.get_event(self)
+        start_dt, duration, title = EventDialog.get_event(self)
         if not start_dt:
-            return
-        end_dt = start_dt + timedelta(hours=1)
+            return  # 用户取消
+
+        end_dt = start_dt + duration
         try:
-            self._add_event_to_calendar(start_dt, end_dt, title,cal_name="个人")
+            self._add_event_to_calendar(start_dt, end_dt, title, cal_name="个人")
+            dur_hours = duration.seconds // 3600
+            dur_mins = (duration.seconds // 60) % 60
             QMessageBox.information(
                 self, "已创建",
-                f"已在 {start_dt.strftime('%m-%d %H:%M')} 创建「{title}」"
+                f"已在 {start_dt.strftime('%m-%d %H:%M')} 创建「{title}」，持续 {dur_hours}h{dur_mins:02d}m"
             )
         except Exception as e:
             QMessageBox.warning(self, "创建失败", str(e))
@@ -251,11 +302,10 @@ class DesktopPet(QWidget):
         end_dt: datetime,
         title: str,
         notes: str = "",
-        cal_name: Optional[str] = None,   # ② 这里改写
+        cal_name: Optional[str] = None,
     ):
         """
         在 macOS 日历中添加事件。
-
         start_dt, end_dt: datetime
         title: 事件标题
         notes: 备注
@@ -289,7 +339,7 @@ class DesktopPet(QWidget):
                         set minutes of eventEnd to {em}
                         set seconds of eventEnd to 0
                         make new event with properties {{summary:"{title}", start date:eventStart, end date:eventEnd, description:"{notes}"}}
-                        return "" --**新增：成功时返回空字符串，防止报错
+                        return "" -- 成功返回空串
                     end tell
                 end tell
             on error errMsg
