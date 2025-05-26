@@ -1,41 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Desktop‑Pet with calendar duration selector (macOS).
+Desktop-Pet with user-customisable themes (macOS).
 """
-import sys, os, json, subprocess
+import sys, os, json, subprocess, shutil
 from pathlib import Path
 from datetime import datetime, timedelta
 import requests
-from typing import Optional
+from typing import Optional, Dict, List
 
 from PyQt5.QtWidgets import (
     QApplication, QLabel, QWidget, QMenu, QMessageBox,
     QInputDialog, QDialog, QVBoxLayout, QHBoxLayout,
-    QPushButton, QDateEdit, QTimeEdit, QLineEdit, QLabel as QtLabel
+    QPushButton, QDateEdit, QTimeEdit, QLineEdit, QLabel as QtLabel,
+    QFileDialog
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QDate, QTime
 from PyQt5.QtGui import QMovie, QPixmap
 
-CONFIG_PATH = Path.home() / ".desktop_pet_config.json"
+# ----------------- 全局常量 -----------------
+CONFIG_PATH  = Path.home() / ".desktop_pet_config.json"
+THEMES_DIR   = Path.home() / ".desktop_pet_themes"        # 每个主题两张 GIF
+THEMES_DIR.mkdir(exist_ok=True)
+DEFAULT_THEME_NAME  = "主题一"
+DEFAULT_CITY        = "杭州"
+DEFAULT_MAIN_GIF    = "mostima.gif"   # 日常
+DEFAULT_RELAX_GIF   = "relax.gif"     # 悬停
 
 # ---------- 高德 API 端点 ----------
 GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
 WEATHER_URL = "https://restapi.amap.com/v3/weather/weatherInfo"
 
 # ---------- 在此填入你的高德 Web API Key ----------
-API_KEY = "e84310e1f93659655488638257320d47"  # ← 换成自己的 Key
+API_KEY = ""   # ← 换成自己的 Key
 # ------------------------------------------------------
 
 # ----------- 天气后台线程 -----------
 class WeatherThread(QThread):
     finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
+    error    = pyqtSignal(str)
 
     def __init__(self, api_key: str, city: str, parent=None):
         super().__init__(parent)
         self.api_key = api_key
-        self.city = city
+        self.city    = city
 
     def run(self):
         try:
@@ -71,43 +79,33 @@ class EventDialog(QDialog):
         self.setWindowTitle("新建日程")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
-        today = QDate.currentDate()
-        next_hour = (datetime.now() + timedelta(hours=1)).time().replace(second=0, microsecond=0)
+        today      = QDate.currentDate()
+        next_hour  = (datetime.now() + timedelta(hours=1)).time().replace(second=0, microsecond=0)
 
-        # 起始日期
-        self.date_edit = QDateEdit(today, self)
+        self.date_edit     = QDateEdit(today, self)
         self.date_edit.setCalendarPopup(True)
 
-        # 起始时间
-        self.time_edit = QTimeEdit(QTime(next_hour.hour, next_hour.minute), self)
+        self.time_edit     = QTimeEdit(QTime(next_hour.hour, next_hour.minute), self)
         self.time_edit.setDisplayFormat("HH:mm")
 
-        # ▶ 新增：持续时长（默认 01:00）
-        self.duration_edit = QTimeEdit(QTime(1, 0), self)
+        self.duration_edit = QTimeEdit(QTime(1, 0), self)   # 默认 1 小时
         self.duration_edit.setDisplayFormat("HH:mm")
-        # 如果想要 5 分钟递增，取消下一行注释
-        # self.duration_edit.setSingleStep(QTime(0, 5))
 
-        # 事件标题
-        self.title_edit = QLineEdit(self)
+        self.title_edit    = QLineEdit(self)
         self.title_edit.setPlaceholderText("事件标题…")
 
-        # 按钮
-        ok_btn = QPushButton("创建", self)
+        ok_btn     = QPushButton("创建", self)
         cancel_btn = QPushButton("取消", self)
         ok_btn.clicked.connect(self.accept)
         cancel_btn.clicked.connect(self.reject)
 
-        # 布局
         vbox = QVBoxLayout(self)
-        vbox.addWidget(QtLabel("选择日期："))
-        vbox.addWidget(self.date_edit)
-        vbox.addWidget(QtLabel("选择时间："))
-        vbox.addWidget(self.time_edit)
-        vbox.addWidget(QtLabel("持续时长："))      # ← 新增
-        vbox.addWidget(self.duration_edit)        # ← 新增
-        vbox.addWidget(QtLabel("事件标题："))
-        vbox.addWidget(self.title_edit)
+        for lbl, w in [("选择日期：", self.date_edit),
+                       ("选择时间：", self.time_edit),
+                       ("持续时长：", self.duration_edit),
+                       ("事件标题：", self.title_edit)]:
+            vbox.addWidget(QtLabel(lbl))
+            vbox.addWidget(w)
 
         hbtn = QHBoxLayout()
         hbtn.addStretch()
@@ -115,7 +113,6 @@ class EventDialog(QDialog):
         hbtn.addWidget(cancel_btn)
         vbox.addLayout(hbtn)
 
-    # -------- 返回起始时间、持续时长、标题 --------
     @staticmethod
     def get_event(parent=None):
         dlg = EventDialog(parent)
@@ -124,7 +121,7 @@ class EventDialog(QDialog):
             t = dlg.time_edit.time().toPyTime()
             start_dt = datetime.combine(d, t)
 
-            dur_qt = dlg.duration_edit.time()
+            dur_qt  = dlg.duration_edit.time()
             duration = timedelta(hours=dur_qt.hour(), minutes=dur_qt.minute())
 
             title = dlg.title_edit.text().strip() or "提醒"
@@ -134,8 +131,53 @@ class EventDialog(QDialog):
 
 # ----------- 桌面宠物 -----------
 class DesktopPet(QWidget):
+
+    # ---------- 配置文件处理 ----------
+    def load_config(self) -> Dict:
+        """读取/初始化配置文件，返回 dict 并写回硬盘"""
+        cfg: Dict = {}
+        if CONFIG_PATH.exists():
+            try:
+                cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                cfg = {}
+
+        # 城市
+        if "city" not in cfg:
+            cfg["city"] = DEFAULT_CITY
+
+        # 主题
+        if "themes" not in cfg:
+            cfg["themes"] = {}
+        if DEFAULT_THEME_NAME not in cfg["themes"]:
+            cfg["themes"][DEFAULT_THEME_NAME] = [
+                self.resource_path(DEFAULT_MAIN_GIF),
+                self.resource_path(DEFAULT_RELAX_GIF),
+            ]
+
+        # 当前主题
+        if "current_theme" not in cfg:
+            cfg["current_theme"] = DEFAULT_THEME_NAME
+
+        # 保存（确保结构完整）
+        self._write_config(cfg)
+        return cfg
+
+    def _write_config(self, cfg: Dict):
+        try:
+            CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", f"无法保存配置：{e}")
+
+    # ---------- 构造函数 ----------
     def __init__(self):
         super().__init__()
+
+        # —— 配置 —— #
+        self.config        = self.load_config()
+        self.city          = self.config["city"]
+        self.themes: Dict[str, List[str]] = self.config["themes"]
+        self.current_theme = self.config["current_theme"]
 
         # —— 窗口 & 透明 —— #
         self.setWindowFlags(
@@ -144,63 +186,202 @@ class DesktopPet(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
-        # —— Label & GIF —— #
+        # —— Label —— #
         self.label = QLabel(self)
         self.label.setStyleSheet("background: transparent; border: none;")
         self.resize(200, 200)
         self.label.resize(200, 200)
 
-        self.movie_main = QMovie(self.resource_path("mostima.gif"))
-        self.movie_relax = QMovie(self.resource_path("relax.gif"))
-        self.movie_main.frameChanged.connect(self.update_frame)
-        self.movie_relax.frameChanged.connect(self.update_frame)
-        self.movie = self.movie_main
-        self.movie.start()
+        # —— 动画 —— #
+        self.movie_main  = None    # 会在 set_theme 中创建
+        self.movie_relax = None
+        self.movie       = None
+        self.set_theme(self.current_theme)   # 初始主题
 
         # —— 状态 —— #
         self.menu_open = False
-        self.dragging = False
+        self.dragging  = False
 
         # —— 运动 —— #
-        self.direction = 1
-        self.speed = 1
-        self.screen_rect = QApplication.primaryScreen().geometry()
-        self.offset = 0
-        self.base_y = self.screen_rect.height() - self.height() - self.offset
+        self.direction    = 1
+        self.speed        = 1
+        self.screen_rect  = QApplication.primaryScreen().geometry()
+        self.offset       = 10
+        self.base_y       = self.screen_rect.height() - self.height() - self.offset
         self.move(100, self.base_y)
 
         self.timer = QTimer(self, timeout=self.move_pet)
         self.timer.start(30)
 
         # —— 城市 & 天气 —— #
-        self.city = self.load_city()
         self.w_thread = None
         self.fetch_weather()
 
-        # —— 新增的天气显示部分 —— #
+        # —— 天气信息控件 —— #
         self.weather_label = QLabel(self)
         self.weather_label.setAlignment(Qt.AlignCenter)
         self.weather_label.setStyleSheet("font-size: 12px; color: white; background: transparent;")
         self.weather_label.setGeometry(0, 20, self.width(), self.height())
 
-        # —— 新增的5秒后隐藏Label —— #
+        # —— 5秒后隐藏天气 —— #
         self.hide_timer = QTimer(self)
-        self.hide_timer.setSingleShot(True)  # 确保只触发一次
+        self.hide_timer.setSingleShot(True)
         self.hide_timer.timeout.connect(self.hide_label)
 
-    def load_city(self):
-        if CONFIG_PATH.exists():
+    # ---------- 资源路径 ----------
+    @staticmethod
+    def resource_path(rel):
+        if getattr(sys, "frozen", False):
+            return os.path.join(os.environ.get("RESOURCEPATH", ""), rel)
+        return os.path.join(os.path.abspath("."), rel)
+
+    # ---------- 主题相关 ----------
+    def set_theme(self, theme_name: str):
+        """根据 theme_name 切换主题"""
+        if theme_name not in self.themes:
+            QMessageBox.warning(self, "切换主题失败", f"找不到主题「{theme_name}」")
+            return
+
+        main_path, relax_path = self.themes[theme_name]
+
+        # 停止旧动画
+        if self.movie_main:  self.movie_main.stop()
+        if self.movie_relax: self.movie_relax.stop()
+
+        # 创建新动画
+        self.movie_main  = QMovie(main_path)
+        self.movie_relax = QMovie(relax_path)
+        self.movie_main.frameChanged.connect(self.update_frame)
+        self.movie_relax.frameChanged.connect(self.update_frame)
+
+        # 切到主动画
+        self.switch_movie(self.movie_main)
+
+        # 更新状态
+        self.current_theme           = theme_name
+        self.config["current_theme"] = theme_name
+        self._write_config(self.config)
+
+    # ---------- 主题：新增 ----------
+    def add_theme(self):
+        """新增主题：先选『日常行走』再选『悬停静止』，完毕后确认顺序并命名"""
+        QMessageBox.information(
+            self, "新增主题向导",
+            "将依次选择两张 GIF：\n1⃣  日常行走（主动画）\n2⃣  悬停静止（鼠标悬浮）"
+        )
+
+        main_path, _ = QFileDialog.getOpenFileName(
+            self, "选择【日常行走】GIF", "", "GIF Files (*.gif)"
+        )
+        if not main_path:
+            return
+
+        relax_path, _ = QFileDialog.getOpenFileName(
+            self, "选择【悬停静止】GIF", "", "GIF Files (*.gif)"
+        )
+        if not relax_path:
+            return
+
+        # —— 让用户确认顺序是否选对 —— #
+        chk = QMessageBox.question(
+            self, "确认 GIF 顺序",
+            f"👉  日常行走：{Path(main_path).name}\n👉  悬停静止：{Path(relax_path).name}\n\n确认无误？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        if chk != QMessageBox.Yes:
+            return
+
+        # —— 命名 —— #
+        name, ok = QInputDialog.getText(self, "主题名称", "输入主题名称：")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in self.themes:
+            QMessageBox.warning(self, "新增主题", "该主题名称已存在！")
+            return
+
+        # —— 复制到私有目录 —— #
+        dest_main  = THEMES_DIR / f"{name}_main.gif"
+        dest_relax = THEMES_DIR / f"{name}_relax.gif"
+        try:
+            shutil.copy(main_path, dest_main)
+            shutil.copy(relax_path, dest_relax)
+        except Exception as e:
+            QMessageBox.warning(self, "新增主题失败", f"复制文件失败：{e}")
+            return
+
+        # —— 更新内存 & 配置 —— #
+        self.themes[name] = [str(dest_main), str(dest_relax)]
+        self.config["themes"] = self.themes
+        self._write_config(self.config)
+
+        # —— 切换到新主题 —— #
+        self.set_theme(name)
+        QMessageBox.information(self, "新增主题", f"「{name}」已添加并启用")
+
+    # ---------- 主题：删除 ----------
+    def delete_current_theme(self):
+        name = self.current_theme
+        if name == DEFAULT_THEME_NAME:
+            QMessageBox.information(self, "删除主题", "默认主题无法删除")
+            return
+        yes = QMessageBox.question(
+            self, "删除确认",
+            f"确定永久删除主题「{name}」？\n文件将移至系统废纸篓。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if yes != QMessageBox.Yes:
+            return
+
+        # —— 删除磁盘文件 —— #
+        for p in self.themes.get(name, []):
             try:
-                return json.loads(CONFIG_PATH.read_text()).get("city", "杭州")
+                Path(p).unlink(missing_ok=True)
             except Exception:
                 pass
-        return "杭州"
 
-    def save_city(self):
+        # —— 从字典里移除并写配置 —— #
+        self.themes.pop(name, None)
+        self.config["themes"] = self.themes
+        # 若删除的是当前主题才切回默认
+        if self.current_theme == name:
+            self.set_theme(DEFAULT_THEME_NAME)
+        self._write_config(self.config)
+
+        QMessageBox.information(self, "删除完成", f"主题「{name}」已删除")
+
+    # ---------- 主题：重命名 ----------
+    def rename_current_theme(self):
+        old = self.current_theme
+        if old == DEFAULT_THEME_NAME:
+            QMessageBox.information(self, "重命名", "默认主题无法重命名")
+            return
+        new, ok = QInputDialog.getText(self, "重命名主题", "新的主题名称：", text=old)
+        new = new.strip() if ok else ""
+        if not new or new == old:
+            return
+        if new in self.themes:
+            QMessageBox.warning(self, "重命名主题", "该名称已存在")
+            return
+
+        # 改文件名，保持磁盘整洁
+        old_main, old_relax = map(Path, self.themes[old])
+        new_main  = old_main.with_name(f"{new}_main.gif")
+        new_relax = old_relax.with_name(f"{new}_relax.gif")
         try:
-            CONFIG_PATH.write_text(json.dumps({"city": self.city}))
-        except Exception as e:
-            QMessageBox.warning(self, "保存失败", f"无法保存城市：{e}")
+            old_main.rename(new_main)
+            old_relax.rename(new_relax)
+        except Exception:
+            # 如果重命名失败就保留原文件名
+            new_main, new_relax = old_main, old_relax
+
+        self.themes[new] = [str(new_main), str(new_relax)]
+        self.themes.pop(old)
+        self.current_theme           = new
+        self.config["themes"]        = self.themes
+        self.config["current_theme"] = new
+        self._write_config(self.config)
+        QMessageBox.information(self, "重命名成功", f"已将主题「{old}」重命名为「{new}」")
 
     # ---------- 天气 ----------
     def fetch_weather(self):
@@ -226,71 +407,100 @@ class DesktopPet(QWidget):
         d2, t2 = fmt(data["tomorrow"])
         msg = f"{self.city} 今天：{d1} {t1}\n{self.city} 明天：{d2} {t2}"
 
-        # 设置天气信息到QLabel
         self.weather_label.setText(msg)
-        self.weather_label.adjustSize()  # 调整 QLabel 大小适应内容
-
-        # 启动定时器，5秒后隐藏 label
+        self.weather_label.adjustSize()
         self.hide_timer.start(5000)
 
     def show_weather_error(self, err):
         self.weather_label.setText(f"获取天气信息失败：{err}")
 
     def hide_label(self):
-        self.weather_label.setText("")  # 清空天气信息
-        self.weather_label.adjustSize()  # 调整大小
+        self.weather_label.setText("")
+        self.weather_label.adjustSize()
         old_x, old_y = self.x(), self.y()
-        self.resize(100,200)  # 调整窗口大小以适应隐藏后的状态
-        self.label.resize(100, 200)  # 调整 QLabel 大小
-        self.move(old_x, old_y)  # 保持原位置
+        self.resize(100, 200)
+        self.label.resize(100, 200)
+        self.move(old_x, old_y)
 
     # ---------- 右键菜单 ----------
     def contextMenuEvent(self, e):
         self.menu_open = True
         running = self.timer.isActive()
         self.timer.stop()
-        self.movie.setPaused(True)
+        if self.movie:
+            self.movie.setPaused(True)
 
-        menu = QMenu(self)
-        loc_act = menu.addAction("位置…")
+        menu      = QMenu(self)
+        loc_act   = menu.addAction("位置…")
+        theme_act = menu.addAction("更换主题…")
         sched_act = menu.addAction("新建日程…")
-        quit_act = menu.addAction("退出")
-        chosen = menu.exec_(e.globalPos())
+        quit_act  = menu.addAction("退出")
+        chosen    = menu.exec_(e.globalPos())
 
         if chosen == loc_act:
             self.change_city()
         elif chosen == sched_act:
             self.create_calendar_event()
+        elif chosen == theme_act:
+            self.change_theme_dialog()
         elif chosen == quit_act:
             QApplication.quit()
 
         self.menu_open = False
         if running:
             self.timer.start(30)
-        self.movie.setPaused(False)
+        if self.movie:
+            self.movie.setPaused(False)
 
+    # ---------- 右键菜单里的主题对话框 ----------
+    def change_theme_dialog(self):
+        while True:
+            items = list(self.themes.keys()) + [
+                "——", "新增主题", "重命名当前主题", "删除当前主题", "取消"
+            ]
+            # 让 QInputDialog 默认选中当前主题
+            cur_idx = items.index(self.current_theme) if self.current_theme in self.themes else 0
+            choice, ok = QInputDialog.getItem(
+                self, "更换主题", "选择操作：", items, current=cur_idx, editable=False
+            )
+            if not ok or choice == "取消" or not choice:
+                return
+            if choice == "新增主题":
+                self.add_theme()
+                continue
+            if choice == "重命名当前主题":
+                self.rename_current_theme()
+                continue
+            if choice == "删除当前主题":
+                self.delete_current_theme()
+                continue
+            if choice == "——":
+                continue
+            # —— 切换主题 —— #
+            self.set_theme(choice)
+            return
     # ---------- 修改城市 ----------
     def change_city(self):
         text, ok = QInputDialog.getText(self, "设置位置", "请输入城市名：", text=self.city)
         if ok and text.strip():
             self.city = text.strip()
-            self.save_city()
+            self.config["city"] = self.city
+            self._write_config(self.config)
             self.fetch_weather()
 
     # ---------- 新建日程 ----------
     def create_calendar_event(self):
         start_dt, duration, title = EventDialog.get_event(self)
         if not start_dt:
-            return  # 用户取消
+            return
 
         end_dt = start_dt + duration
         try:
             self._add_event_to_calendar(start_dt, end_dt, title, cal_name="个人")
-            dur_hours = duration.seconds // 3600
-            dur_mins = (duration.seconds // 60) % 60
+            dh, dm = divmod(duration.seconds // 60, 60)
             QMessageBox.information(
                 self, "已创建",
-                f"已在 {start_dt.strftime('%m-%d %H:%M')} 创建「{title}」，持续 {dur_hours}h{dur_mins:02d}m"
+                f"已在 {start_dt.strftime('%m-%d %H:%M')} 创建「{title}」，持续 {dh}h{dm:02d}m"
             )
         except Exception as e:
             QMessageBox.warning(self, "创建失败", str(e))
@@ -304,19 +514,12 @@ class DesktopPet(QWidget):
         notes: str = "",
         cal_name: Optional[str] = None,
     ):
-        """
-        在 macOS 日历中添加事件。
-        start_dt, end_dt: datetime
-        title: 事件标题
-        notes: 备注
-        cal_name: 日历名称，None 时依次尝试“日历”→“Calendar”
-        """
         try_names = ["日历", "Calendar"] if cal_name is None else [cal_name]
 
-        sy, sM, sd = start_dt.year, start_dt.month, start_dt.day
-        sh, sm = start_dt.hour, start_dt.minute
-        ey, eM, ed = end_dt.year, end_dt.month, end_dt.day
-        eh, em = end_dt.hour, end_dt.minute
+        sy, sM, sd = start_dt.year,  start_dt.month,  start_dt.day
+        sh, sm     = start_dt.hour,  start_dt.minute
+        ey, eM, ed = end_dt.year,    end_dt.month,    end_dt.day
+        eh, em     = end_dt.hour,    end_dt.minute
 
         success, last_err = False, ""
         for name in try_names:
@@ -325,21 +528,21 @@ class DesktopPet(QWidget):
                 tell application "Calendar"
                     tell calendar "{name}"
                         set eventStart to (current date)
-                        set year of eventStart to {sy}
-                        set month of eventStart to {sM}
-                        set day of eventStart to {sd}
-                        set hours of eventStart to {sh}
+                        set year of eventStart   to {sy}
+                        set month of eventStart  to {sM}
+                        set day of eventStart    to {sd}
+                        set hours of eventStart  to {sh}
                         set minutes of eventStart to {sm}
                         set seconds of eventStart to 0
                         set eventEnd to (current date)
-                        set year of eventEnd to {ey}
-                        set month of eventEnd to {eM}
-                        set day of eventEnd to {ed}
-                        set hours of eventEnd to {eh}
+                        set year of eventEnd   to {ey}
+                        set month of eventEnd  to {eM}
+                        set day of eventEnd    to {ed}
+                        set hours of eventEnd  to {eh}
                         set minutes of eventEnd to {em}
                         set seconds of eventEnd to 0
                         make new event with properties {{summary:"{title}", start date:eventStart, end date:eventEnd, description:"{notes}"}}
-                        return "" -- 成功返回空串
+                        return ""
                     end tell
                 end tell
             on error errMsg
@@ -361,16 +564,11 @@ class DesktopPet(QWidget):
             raise RuntimeError(f"无法写入日历，AppleScript 错误信息：{last_err}")
 
     # ---------- 其余动画/交互 ----------
-    @staticmethod
-    def resource_path(rel):
-        if getattr(sys, "frozen", False):
-            return os.path.join(os.environ.get("RESOURCEPATH", ""), rel)
-        return os.path.join(os.path.abspath("."), rel)
-
-    def switch_movie(self, new_movie):
+    def switch_movie(self, new_movie: QMovie):
         if self.movie is new_movie:
             return
-        self.movie.stop()
+        if self.movie:
+            self.movie.stop()
         self.movie = new_movie
         self.movie.start()
 
@@ -413,7 +611,7 @@ class DesktopPet(QWidget):
         if e.buttons() & Qt.LeftButton and self.dragging:
             new_pos = e.globalPos() - self.drag_pos
             self.move(
-                max(0, min(new_pos.x(), self.screen_rect.width() - self.width())),
+                max(0, min(new_pos.x(), self.screen_rect.width()  - self.width())),
                 max(0, min(new_pos.y(), self.screen_rect.height() - self.height()))
             )
             e.accept()
@@ -421,7 +619,7 @@ class DesktopPet(QWidget):
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and self.dragging:
             self.dragging = False
-            self.base_y = self.y()
+            self.base_y   = self.y()
             if not self.rect().contains(self.mapFromGlobal(e.globalPos())):
                 self.switch_movie(self.movie_main)
                 self.timer.start(30)
